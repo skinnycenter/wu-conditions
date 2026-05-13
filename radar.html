@@ -18,8 +18,6 @@
     font-size:14px; letter-spacing:0.04em;
     pointer-events:none;
   }
-  /* Hide Leaflet attribution to keep the view clean on DAKBoard.
-     If you want to be courteous to OSM/RainViewer, set display:block. */
   .leaflet-control-attribution { display:none; }
   .leaflet-control-zoom { display:none; }
 </style>
@@ -31,28 +29,30 @@
 <script>
 /* ============================================================
    RainViewer animated radar — centered on Saratoga Springs, NY
-   - Pulls latest frame list from RainViewer API every 5 min
-   - Plays an animation loop of the last ~2 hours of radar
-   - Light base map (CartoDB Positron) so it doesn't feel as dark
-     as Windy. Swap BASEMAP_URL to switch styles.
+   FIX: RainViewer free public API only serves radar tiles up to
+   zoom 7. If MAP_ZOOM > 7, the base map renders but radar shows
+   nothing — that's what caused the "timestamp moves but no rain"
+   issue. We now cap at 7.
    ============================================================ */
 
 const CENTER     = [43.083, -73.785]; // Saratoga Springs, NY
-const ZOOM       = 8;                  // 7 wider, 9 tighter
-const FRAME_MS   = 500;                // ms between animation frames
-const REFRESH_MS = 5 * 60 * 1000;      // re-fetch API every 5 min
+const MAP_ZOOM   = 7;                  // keep at 7 (RainViewer max)
+const FRAME_MS   = 500;                // animation interval
+const REFRESH_MS = 5 * 60 * 1000;      // re-fetch every 5 min
+const TILE_SIZE  = 256;
+const RADAR_OPACITY = 0.75;
+const COLOR_SCHEME  = 2;               // 2 = Universal Blue
 
-// --- Base map options (pick one by uncommenting) ---
-// Light / clean:
+// Base map options — uncomment one:
 const BASEMAP_URL = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png";
-// Dark (matches Windy aesthetic): 
 // const BASEMAP_URL = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
-// Standard OSM (more colorful):
 // const BASEMAP_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
 
 const map = L.map("map", {
   center: CENTER,
-  zoom: ZOOM,
+  zoom: MAP_ZOOM,
+  minZoom: 3,
+  maxZoom: 7,
   zoomControl: false,
   attributionControl: false,
   dragging: false,
@@ -64,82 +64,81 @@ const map = L.map("map", {
 
 L.tileLayer(BASEMAP_URL, { maxZoom: 19 }).addTo(map);
 
-// Optional: drop a subtle marker on Saratoga
 L.circleMarker(CENTER, {
-  radius: 5, color: "#fff", weight: 2, fillColor: "#ff5722", fillOpacity: 0.9
+  radius: 6, color: "#fff", weight: 2, fillColor: "#ff5722", fillOpacity: 0.95
 }).addTo(map);
 
 let frames = [];
 let host = "";
 let layers = {};
 let position = 0;
-let timer = null;
+let animTimer = null;
 
-async function fetchFrames() {
-  try {
-    const res = await fetch("https://api.rainviewer.com/public/weather-maps.json");
-    const data = await res.json();
-    host = data.host;
-    // Combine past radar + nowcast for a "what's happening + next ~30 min" loop
-    const past = data.radar?.past || [];
-    const nowcast = data.radar?.nowcast || [];
-    frames = past.concat(nowcast);
-
-    // Clear stale layers
-    Object.values(layers).forEach(l => map.removeLayer(l));
-    layers = {};
-    position = 0;
-
-    if (timer) clearInterval(timer);
-    timer = setInterval(animate, FRAME_MS);
-    animate();
-  } catch (e) {
-    console.warn("RainViewer fetch failed:", e);
-    document.getElementById("timestamp").textContent = "Radar unavailable";
-  }
+function tileUrl(frame) {
+  return `${host}${frame.path}/${TILE_SIZE}/{z}/{x}/{y}/${COLOR_SCHEME}/1_1.png`;
 }
 
-function radarTileUrl(frame) {
-  // path / size / color / options(smooth_snow)
-  // color schemes: 0 BW, 1 original, 2 universal blue, 3 TITAN,
-  // 4 weather channel, 5 NEXRAD, 6 rainbow, 7 dark sky, 8 universal red/green
-  const colorScheme = 2; // universal blue — reads well on light base
-  const size = 256;
-  return `${host}${frame.path}/${size}/{z}/{x}/{y}/${colorScheme}/1_1.png`;
+function preloadLayer(frame) {
+  if (layers[frame.time]) return layers[frame.time];
+  const layer = L.tileLayer(tileUrl(frame), {
+    tileSize: TILE_SIZE,
+    opacity: 0,
+    zIndex: 100,
+  });
+  layer.addTo(map);
+  layers[frame.time] = layer;
+  return layer;
 }
 
 function showFrame(idx) {
   const frame = frames[idx];
   if (!frame) return;
+  preloadLayer(frame);
 
-  if (!layers[frame.time]) {
-    layers[frame.time] = L.tileLayer(radarTileUrl(frame), {
-      opacity: 0,
-      tileSize: 256,
-      zIndex: frame.time,
-    }).addTo(map);
-  }
-  // Fade in this frame, fade others out
   Object.entries(layers).forEach(([t, layer]) => {
-    layer.setOpacity(parseInt(t, 10) === frame.time ? 0.75 : 0);
+    layer.setOpacity(Number(t) === frame.time ? RADAR_OPACITY : 0);
   });
 
-  const isNowcast = frames.slice(0, frames.length).indexOf(frame) >=
-                    (frames.length - 3); // last few are forecast
   const ts = new Date(frame.time * 1000);
   const label = ts.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   document.getElementById("timestamp").textContent =
-    (isNowcast ? "Forecast " : "") + label;
+    (frame.isForecast ? "Forecast " : "") + label;
 }
 
-function animate() {
+function tick() {
   if (!frames.length) return;
   showFrame(position);
   position = (position + 1) % frames.length;
 }
 
-fetchFrames();
-setInterval(fetchFrames, REFRESH_MS);
+async function refresh() {
+  try {
+    const res = await fetch("https://api.rainviewer.com/public/weather-maps.json");
+    const data = await res.json();
+    host = data.host;
+
+    const past    = (data.radar?.past    || []).map(f => ({ ...f, isForecast: false }));
+    const nowcast = (data.radar?.nowcast || []).map(f => ({ ...f, isForecast: true  }));
+    const newFrames = past.concat(nowcast);
+
+    Object.values(layers).forEach(l => map.removeLayer(l));
+    layers = {};
+    frames = newFrames;
+    position = 0;
+
+    frames.forEach(preloadLayer);
+
+    if (animTimer) clearInterval(animTimer);
+    tick();
+    animTimer = setInterval(tick, FRAME_MS);
+  } catch (e) {
+    console.error("RainViewer fetch failed:", e);
+    document.getElementById("timestamp").textContent = "Radar unavailable";
+  }
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
 </script>
 </body>
 </html>
