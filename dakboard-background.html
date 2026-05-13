@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DAKBoard Reactive Background</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#0a0a0a; overflow:hidden; }
+  .layer {
+    position:absolute; inset:0;
+    background-size:cover; background-position:center; background-repeat:no-repeat;
+    opacity:0; transition:opacity 1.6s ease-in-out; will-change:opacity;
+  }
+  .layer.visible { opacity:1; }
+  .vignette {
+    position:absolute; inset:0; pointer-events:none;
+    background:
+      linear-gradient(to bottom,
+        rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.15) 18%,
+        rgba(0,0,0,0.10) 50%, rgba(0,0,0,0.25) 82%,
+        rgba(0,0,0,0.65) 100%),
+      radial-gradient(ellipse at center,
+        rgba(0,0,0,0) 55%, rgba(0,0,0,0.35) 100%);
+  }
+  .debug {
+    position:absolute; left:12px; bottom:12px; max-width:90%;
+    color:rgba(255,255,255,0.6); font-size:14px;
+    font-family:-apple-system,system-ui,sans-serif; letter-spacing:0.04em;
+    text-shadow:0 1px 2px rgba(0,0,0,0.8); display:none;
+  }
+  body.debug .debug { display:block; }
+</style>
+</head>
+<body>
+  <div id="layerA" class="layer"></div>
+  <div id="layerB" class="layer"></div>
+  <div class="vignette"></div>
+  <div class="debug" id="debug"></div>
+
+<script>
+/* =====================================================================
+   DAKBoard Reactive Background v2
+   - Pulls station lat/long from PWS metadata on first load
+   - Polls every 5 min:
+       1. PWS observations  -> ground truth (your roof wins on precip presence)
+       2. WU current conditions at station coords -> phrase + lightning
+   - Lightning ALWAYS wins. Otherwise:
+       PWS dry + WU wet  -> trust PWS (no precip at your house)
+       PWS wet + WU phrase -> WU sets type, PWS sets intensity
+   - Granular winter: flurries, light_snow, snow, heavy_snow, blizzard,
+     freezing_rain, sleet, wintry_mix, hail
+   - Crossfades only when resolved key changes
+   - ?debug=1 shows live key + raw inputs
+   ===================================================================== */
+
+const CONFIG = {
+  STATION_ID: "KNYBALLS111",
+  WU_API_KEY: "eaH6I4sr",
+  POLL_MS: 5 * 60 * 1000,
+  IMG_W: 2160,
+  IMG_H: 3840,
+};
+
+const wuPwsCurrentUrl = () =>
+  "https://api.weather.com/v2/pws/observations/current"
+  + "?stationId=" + CONFIG.STATION_ID
+  + "&format=json&units=e&apiKey=" + CONFIG.WU_API_KEY;
+
+const wuConditionsUrl = (lat, lon) =>
+  "https://api.weather.com/v3/wx/observations/current"
+  + "?geocode=" + lat + "," + lon
+  + "&units=e&language=en-US&format=json&apiKey=" + CONFIG.WU_API_KEY;
+
+function num(v) { if (v==null) return null; const n=+v; return isNaN(n)?null:n; }
+
+function timeBucket(d) {
+  const h = d.getHours();
+  if (h>=5 && h<8)   return "sunrise";
+  if (h>=8 && h<17)  return "day";
+  if (h>=17 && h<20) return "sunset";
+  return "night";
+}
+function season(d) {
+  const m = d.getMonth();
+  if (m===11 || m<=1) return "winter";
+  if (m>=2 && m<=4)   return "spring";
+  if (m>=5 && m<=7)   return "summer";
+  return "autumn";
+}
+
+/* ---------- WU phrase -> condition token ---------- */
+function phraseToCondition(p) {
+  if (!p) return null;
+  p = p.toLowerCase();
+  if (p.includes("thunder") || p.includes("t-storm") || p.includes("tstm") || p.includes("lightning")) return "lightning";
+  if (p.includes("freezing rain") || p.includes("freezing drizzle")) return "freezing_rain";
+  if (p.includes("sleet") || p.includes("ice pellets"))              return "sleet";
+  if (p.includes("wintry mix") || p.includes("rain and snow") ||
+      p.includes("snow and rain") || p.includes("rain/snow"))        return "wintry_mix";
+  if (p.includes("blizzard"))                                        return "blizzard";
+  if (p.includes("heavy snow"))                                      return "heavy_snow";
+  if (p.includes("flurries") || p.includes("flurry"))                return "flurries";
+  if (p.includes("light snow") || p.includes("snow shower"))         return "light_snow";
+  if (p.includes("snow"))                                            return "snow";
+  if (p.includes("heavy rain") || p.includes("downpour"))            return "heavy_rain";
+  if (p.includes("light rain") || p.includes("drizzle") || p.includes("light shower")) return "light_rain";
+  if (p.includes("rain") || p.includes("shower"))                    return "rain";
+  if (p.includes("hail"))                                            return "hail";
+  if (p.includes("smoke") || p.includes("wildfire"))                 return "smoke";
+  if (p.includes("haze"))                                            return "haze";
+  if (p.includes("fog") || p.includes("mist"))                       return "fog";
+  if (p.includes("windy") || p.includes("breezy"))                   return "windy";
+  if (p.includes("overcast"))                                        return "overcast";
+  if (p.includes("mostly cloudy"))                                   return "cloudy";
+  if (p.includes("partly cloudy") || p.includes("partly sunny"))     return "partly_cloudy";
+  if (p.includes("mostly sunny") || p.includes("mostly clear"))      return "mostly_clear";
+  if (p.includes("fair") || p.includes("sunny") || p.includes("clear")) return "clear";
+  return null;
+}
+
+/* ---------- PWS-only classifier ---------- */
+function classifyFromPWS(obs) {
+  if (!obs) return "clear";
+  const im = obs.imperial || {};
+  const rate  = num(im.precipRate)  ?? 0;
+  const total = num(im.precipTotal) ?? 0;
+  const temp  = num(im.temp);
+  const gust  = num(im.windGust)    ?? 0;
+  const hum   = num(obs.humidity)   ?? 0;
+  const sol   = num(obs.solarRadiation);
+  const frozen = temp !== null && temp <= 34;
+
+  if (rate >= 0.30) return frozen ? "heavy_snow" : "heavy_rain";
+  if (rate >= 0.10) return frozen ? "snow"       : "rain";
+  if (rate >= 0.02) return frozen ? "light_snow" : "light_rain";
+  if (total > 0.05 && rate > 0) return frozen ? "flurries" : "light_rain";
+  if (gust >= 35) return "windy";
+  if (hum >= 92 && (sol === null || sol < 80)) return "fog";
+
+  const h = new Date().getHours();
+  const day = h >= 8 && h < 18;
+  if (day && sol !== null) {
+    if (sol < 150) return "overcast";
+    if (sol < 350) return "cloudy";
+    if (sol < 600) return "partly_cloudy";
+  }
+  return "clear";
+}
+
+/* ---------- Conflict resolver ---------- */
+function resolveCondition(pwsObs, wuCond) {
+  if (wuCond === "lightning") return "lightning"; // override
+
+  const pwsCond = classifyFromPWS(pwsObs);
+  const PRECIP = ["heavy_rain","rain","light_rain","heavy_snow","snow","light_snow","flurries"];
+  const PRECIP_PLUS = PRECIP.concat(["freezing_rain","sleet","wintry_mix","blizzard","hail"]);
+  const pwsPrecip = PRECIP.includes(pwsCond);
+  const wuPrecip  = wuCond && PRECIP_PLUS.includes(wuCond);
+
+  // PWS dry, WU wet -> trust the roof
+  if (!pwsPrecip && wuPrecip) return pwsCond;
+
+  // PWS wet -> WU refines TYPE, PWS sets INTENSITY
+  if (pwsPrecip && wuCond) {
+    if (["freezing_rain","sleet","wintry_mix","blizzard","hail"].includes(wuCond)) return wuCond;
+    if (["heavy_snow","snow","light_snow","flurries"].includes(wuCond)) {
+      if (["heavy_snow","snow","light_snow","flurries"].includes(pwsCond)) return pwsCond;
+      return pwsCond === "heavy_rain" ? "heavy_snow"
+           : pwsCond === "rain"        ? "snow"
+           : pwsCond === "light_rain"  ? "light_snow"
+           : "flurries";
+    }
+    return pwsCond; // rain family
+  }
+
+  // Both dry -> prefer WU sky-state, else PWS
+  if (wuCond && !wuPrecip) return wuCond;
+  return pwsCond;
+}
+
+/* ---------- Image query bank ---------- */
+const QUERIES = {
+  lightning: {
+    sunrise:{winter:["lightning over snowy mountains","thunderhead snowy peaks dawn"],spring:["lightning over meadow dawn","spring lightning storm"],summer:["lightning over mountains sunrise","thunderbolt dawn"],autumn:["lightning over autumn forest","fall thunderstorm dawn"]},
+    day:    {winter:["lightning snowy landscape","winter thunderstorm bolt"],spring:["lightning bolt green valley","spring thunderstorm landscape"],summer:["dramatic lightning bolt mountains","lightning over lake"],autumn:["lightning autumn landscape","fall thunderstorm bolt"]},
+    sunset: {winter:["lightning snowy peak sunset","winter thunderstorm dusk"],spring:["lightning meadow sunset","spring thunderstorm dusk"],summer:["lightning over ocean sunset","thunderstorm golden hour"],autumn:["lightning autumn forest sunset","fall thunderstorm dusk"]},
+    night:  {winter:["lightning bolt snowy night","winter night thunderstorm"],spring:["lightning bolt night sky","spring thunderstorm night"],summer:["lightning bolt night mountains","dramatic night lightning"],autumn:["lightning autumn night","fall thunderstorm night"]},
+  },
+  flurries: {
+    sunrise:{winter:["snow flurries pine forest dawn","light flurries morning"],spring:["spring flurries meadow","late season flurries dawn"],summer:["alpine flurries summit dawn","high altitude flurries"],autumn:["first flurries autumn forest","light flurries fall morning"]},
+    day:    {winter:["snow flurries forest","light snow flurries trees"],spring:["spring flurries landscape","late flurries hills"],summer:["alpine flurries summer","mountain flurries"],autumn:["flurries on autumn leaves","light flurries fall forest"]},
+    sunset: {winter:["snow flurries dusk forest","flurries winter sunset"],spring:["spring flurries dusk","late flurries sunset"],summer:["alpine flurries dusk","mountain flurries sunset"],autumn:["autumn flurries dusk","flurries fall sunset"]},
+    night:  {winter:["snow flurries night porch light","light snow night forest"],spring:["spring flurries night","late flurries evening"],summer:["alpine flurries night","mountain flurries night"],autumn:["autumn flurries night","light flurries fall night"]},
+  },
+  light_snow: {
+    sunrise:{winter:["light snow falling pine forest dawn","gentle snowfall morning"],spring:["spring light snow meadow","late light snow morning"],summer:["alpine light snowfall dawn","high mountain light snow"],autumn:["light snow autumn leaves dawn","early light snowfall morning"]},
+    day:    {winter:["light snowfall forest path","gentle snow pine trees"],spring:["spring light snowfall hills","late light snow landscape"],summer:["alpine light snowfall","mountain light snow"],autumn:["light snow on fall leaves","autumn light snowfall"]},
+    sunset: {winter:["light snow falling dusk","gentle snowfall sunset"],spring:["spring light snow sunset","late light snow dusk"],summer:["alpine light snow sunset","mountain light snow dusk"],autumn:["light snow autumn sunset","gentle fall snowfall dusk"]},
+    night:  {winter:["light snowfall night street lamp","gentle snow night forest"],spring:["spring light snow night","late light snow evening"],summer:["alpine light snow night","mountain light snow night"],autumn:["light snow autumn night","gentle fall snowfall night"]},
+  },
+  snow: {
+    sunrise:{winter:["snowfall pine forest morning","steady snow dawn forest"],spring:["spring snowfall mountains","late season snow morning"],summer:["alpine snowfall summit","mountain summer snow"],autumn:["snow on autumn forest dawn","early snowfall fall morning"]},
+    day:    {winter:["snowy pine forest snowfall","steady snowfall winter trees"],spring:["spring snow mountains","late season snowfall"],summer:["alpine snowfall","glacier summer snow"],autumn:["snow on autumn leaves","first snowfall fall forest"]},
+    sunset: {winter:["snowfall dusk forest","steady snow winter sunset"],spring:["spring snow sunset","late snowfall dusk"],summer:["alpine snow sunset","glacier dusk"],autumn:["autumn snow sunset","fall snowfall dusk"]},
+    night:  {winter:["snowfall night forest","steady snow night pines"],spring:["spring snow night","late snowfall evening"],summer:["alpine snow night","glacier night"],autumn:["autumn snow night","fall snowfall night"]},
+  },
+  heavy_snow: {
+    sunrise:{winter:["heavy snowfall pine forest dawn","blizzard conditions morning"],spring:["heavy spring snowfall mountains","late heavy snow dawn"],summer:["alpine heavy snowfall","mountain heavy snow"],autumn:["heavy early snowfall autumn","fall heavy snowstorm dawn"]},
+    day:    {winter:["heavy snowstorm forest","whiteout snowfall trees"],spring:["heavy spring snowstorm","late heavy snowfall landscape"],summer:["alpine heavy snowstorm","mountain heavy snow"],autumn:["heavy snow autumn forest","fall heavy snowstorm"]},
+    sunset: {winter:["heavy snowfall winter dusk","heavy snowstorm sunset"],spring:["heavy spring snow sunset","late heavy snowfall dusk"],summer:["alpine heavy snow sunset","mountain heavy snow dusk"],autumn:["heavy autumn snowstorm sunset","fall heavy snow dusk"]},
+    night:  {winter:["heavy snowfall night","heavy snowstorm night forest"],spring:["heavy spring snow night","late heavy snowfall night"],summer:["alpine heavy snow night","mountain heavy snow night"],autumn:["heavy autumn snow night","fall heavy snowstorm night"]},
+  },
+  blizzard: {
+    sunrise:{winter:["blizzard whiteout dawn","blizzard winds morning"],spring:["late blizzard dawn","spring blizzard mountains"],summer:["alpine blizzard summit","mountain blizzard"],autumn:["early blizzard autumn","fall blizzard morning"]},
+    day:    {winter:["blizzard whiteout forest","blizzard winds snowy trees"],spring:["late blizzard landscape","spring blizzard mountains"],summer:["alpine blizzard","glacier blizzard"],autumn:["autumn blizzard","fall blizzard whiteout"]},
+    sunset: {winter:["blizzard winter dusk","whiteout snowstorm sunset"],spring:["late blizzard sunset","spring blizzard dusk"],summer:["alpine blizzard sunset","mountain blizzard dusk"],autumn:["autumn blizzard sunset","fall blizzard dusk"]},
+    night:  {winter:["blizzard night","whiteout night snowstorm"],spring:["late blizzard night","spring blizzard evening"],summer:["alpine blizzard night","mountain blizzard night"],autumn:["autumn blizzard night","fall blizzard night"]},
+  },
+  freezing_rain: {
+    sunrise:{winter:["ice covered branches dawn","freezing rain glazed trees morning"],spring:["late freezing rain dawn","ice glazed branches morning"],summer:["alpine ice glaze","mountain ice morning"],autumn:["ice glazed autumn leaves","freezing rain fall morning"]},
+    day:    {winter:["ice storm glazed trees","freezing rain crystal branches"],spring:["late ice storm landscape","glazed branches spring"],summer:["alpine ice glaze","mountain ice"],autumn:["ice glazed autumn forest","freezing rain fall leaves"]},
+    sunset: {winter:["ice storm sunset glaze","freezing rain dusk trees"],spring:["late ice storm sunset","glazed branches dusk"],summer:["alpine ice sunset","mountain ice dusk"],autumn:["ice glazed autumn sunset","freezing rain fall dusk"]},
+    night:  {winter:["ice storm night glaze","freezing rain night trees"],spring:["late ice storm night","glazed branches night"],summer:["alpine ice night","mountain ice night"],autumn:["ice glazed autumn night","freezing rain fall night"]},
+  },
+  sleet: {
+    sunrise:{winter:["sleet ice pellets ground dawn","sleet on pines morning"],spring:["late sleet meadow dawn","spring sleet morning"],summer:["alpine sleet summit","mountain sleet"],autumn:["sleet autumn leaves dawn","fall sleet morning"]},
+    day:    {winter:["sleet ice pellets forest","sleet on snow"],spring:["spring sleet landscape","late sleet hills"],summer:["alpine sleet","mountain sleet"],autumn:["sleet on autumn leaves","fall sleet forest"]},
+    sunset: {winter:["sleet dusk forest","sleet winter sunset"],spring:["spring sleet sunset","late sleet dusk"],summer:["alpine sleet sunset","mountain sleet dusk"],autumn:["autumn sleet sunset","fall sleet dusk"]},
+    night:  {winter:["sleet night forest","sleet on pines night"],spring:["spring sleet night","late sleet evening"],summer:["alpine sleet night","mountain sleet night"],autumn:["autumn sleet night","fall sleet night"]},
+  },
+  wintry_mix: {
+    sunrise:{winter:["wintry mix slushy ground dawn","rain and snow morning"],spring:["late wintry mix dawn","rain snow mix morning"],summer:["alpine wintry mix","mountain mixed precip"],autumn:["wintry mix autumn leaves","early wintry mix morning"]},
+    day:    {winter:["wintry mix slushy forest","rain and snow trees"],spring:["spring wintry mix","late mixed precip landscape"],summer:["alpine wintry mix","mountain rain snow"],autumn:["wintry mix autumn forest","fall mixed precip"]},
+    sunset: {winter:["wintry mix winter dusk","rain snow sunset"],spring:["spring wintry mix sunset","late mixed precip dusk"],summer:["alpine wintry mix sunset","mountain mixed dusk"],autumn:["wintry mix autumn sunset","fall mixed dusk"]},
+    night:  {winter:["wintry mix night forest","rain snow night"],spring:["spring wintry mix night","late mixed precip night"],summer:["alpine wintry mix night","mountain mixed night"],autumn:["wintry mix autumn night","fall mixed night"]},
+  },
+  hail: {
+    sunrise:{winter:["hail on ground dawn","hailstones morning"],spring:["spring hailstorm dawn","hail on meadow morning"],summer:["summer hailstorm dawn","hail ground morning"],autumn:["autumn hailstorm dawn","hail fall morning"]},
+    day:    {winter:["hail on snow","hailstones forest"],spring:["spring hailstorm","hail on green grass"],summer:["summer hailstorm landscape","hail covered ground"],autumn:["autumn hailstorm","hail on fall leaves"]},
+    sunset: {winter:["hail dusk","hailstones sunset"],spring:["spring hail sunset","hailstorm dusk"],summer:["summer hail sunset","hailstorm golden hour"],autumn:["autumn hail sunset","hailstorm fall dusk"]},
+    night:  {winter:["hailstorm night","hail night ground"],spring:["spring hail night","hailstorm evening"],summer:["summer hail night","hailstorm night sky"],autumn:["autumn hail night","hailstorm fall night"]},
+  },
+  light_rain: {
+    sunrise:{winter:["light winter rain forest dawn","drizzle bare trees morning"],spring:["light spring rain meadow dawn","gentle rain dawn meadow"],summer:["light summer rain forest dawn","drizzle morning leaves"],autumn:["light autumn rain forest dawn","drizzle fall leaves morning"]},
+    day:    {winter:["light winter rain bare trees","drizzle on snow"],spring:["light spring rain green leaves","drizzle meadow"],summer:["light summer rain forest","drizzle on leaves"],autumn:["drizzle on autumn leaves","light rain fall forest"]},
+    sunset: {winter:["light winter rain dusk","drizzle bare trees sunset"],spring:["light spring rain sunset","drizzle meadow dusk"],summer:["light summer rain sunset","drizzle golden hour"],autumn:["light autumn rain sunset","drizzle fall dusk"]},
+    night:  {winter:["drizzle winter night","light rain night bare trees"],spring:["light spring rain night","drizzle meadow night"],summer:["light summer rain night","drizzle forest night"],autumn:["light autumn rain night","drizzle fall night"]},
+  },
+  rain: {
+    sunrise:{winter:["winter rain forest dawn","cold rain bare trees morning"],spring:["spring rain meadow dawn","steady rain dawn forest"],summer:["summer rain forest dawn","rain on leaves morning"],autumn:["autumn rain forest dawn","rain on fall leaves morning"]},
+    day:    {winter:["winter rain bare trees","cold rain landscape"],spring:["spring rain green meadow","steady rain forest"],summer:["summer rain green forest","rain dripping leaves"],autumn:["rain on autumn leaves","wet fall forest"]},
+    sunset: {winter:["winter rain dusk","cold rain sunset bare trees"],spring:["spring rain sunset","steady rain meadow dusk"],summer:["summer rain sunset","rain golden hour forest"],autumn:["autumn rain sunset","rain fall forest dusk"]},
+    night:  {winter:["winter rain night","cold rain bare trees night"],spring:["spring rain night","steady rain meadow night"],summer:["summer rain night","rain on leaves night"],autumn:["autumn rain night","rain fall forest night"]},
+  },
+  heavy_rain: {
+    sunrise:{winter:["heavy winter rain forest dawn","torrential cold rain morning"],spring:["heavy spring rain dawn","downpour spring forest"],summer:["heavy summer rain forest dawn","tropical downpour morning"],autumn:["heavy autumn rain forest dawn","downpour fall morning"]},
+    day:    {winter:["heavy winter rainstorm","torrential cold rain"],spring:["heavy spring rainstorm","downpour green forest"],summer:["heavy summer rainstorm","tropical downpour forest"],autumn:["heavy autumn rainstorm","downpour fall forest"]},
+    sunset: {winter:["heavy winter rain dusk","torrential cold rain sunset"],spring:["heavy spring rain sunset","downpour spring dusk"],summer:["heavy summer rain sunset","tropical downpour dusk"],autumn:["heavy autumn rain sunset","downpour fall dusk"]},
+    night:  {winter:["heavy winter rain night","torrential rain bare trees night"],spring:["heavy spring rain night","downpour night forest"],summer:["heavy summer rain night","tropical downpour night"],autumn:["heavy autumn rain night","downpour fall night"]},
+  },
+  fog: {
+    sunrise:{winter:["foggy winter dawn","misty snow morning"],spring:["foggy meadow dawn","misty spring morning"],summer:["foggy lake morning","misty forest dawn"],autumn:["foggy autumn morning","misty fall forest"]},
+    day:    {winter:["foggy snow forest","misty winter landscape"],spring:["foggy green valley","misty spring hills"],summer:["foggy mountain lake","misty pine forest"],autumn:["foggy autumn forest","misty fall trees"]},
+    sunset: {winter:["foggy winter dusk","misty snow sunset"],spring:["foggy meadow dusk","misty spring sunset"],summer:["foggy lake sunset","misty forest dusk"],autumn:["foggy autumn sunset","misty fall dusk"]},
+    night:  {winter:["foggy winter night","misty snow night"],spring:["foggy spring night","misty meadow night"],summer:["foggy summer night","misty lake night"],autumn:["foggy autumn night","misty fall night"]},
+  },
+  smoke: {
+    sunrise:{winter:["wildfire smoke haze sunrise mountains","smoky orange sky dawn forest"],spring:["wildfire smoke haze spring dawn","smoky orange sunrise meadow"],summer:["wildfire smoke red sun dawn","smoky orange sky forest morning"],autumn:["wildfire smoke autumn forest dawn","smoky orange sunrise fall"]},
+    day:    {winter:["wildfire smoke haze mountains","smoky air winter landscape"],spring:["wildfire smoke spring valley","smoky haze green hills"],summer:["wildfire smoke red sun forest","smoky orange haze landscape"],autumn:["wildfire smoke autumn forest","smoky haze fall trees"]},
+    sunset: {winter:["wildfire smoke red sunset mountains","smoky orange winter dusk"],spring:["wildfire smoke red sunset meadow","smoky orange spring dusk"],summer:["wildfire smoke blood red sunset","smoky orange summer dusk"],autumn:["wildfire smoke autumn sunset","smoky orange fall dusk"]},
+    night:  {winter:["wildfire smoke night red moon","smoky haze winter night"],spring:["wildfire smoke night meadow","smoky spring night"],summer:["wildfire smoke red moon night","smoky summer night"],autumn:["wildfire smoke autumn night","smoky fall night red moon"]},
+  },
+  haze: {
+    sunrise:{winter:["hazy winter dawn distant mountains","atmospheric haze winter morning"],spring:["hazy meadow dawn","atmospheric haze spring morning"],summer:["hazy summer dawn distant hills","heat haze morning"],autumn:["hazy autumn dawn","atmospheric haze fall morning"]},
+    day:    {winter:["hazy winter landscape distant peaks","atmospheric haze snowy mountains"],spring:["hazy spring valley distant hills","atmospheric haze meadow"],summer:["heat haze summer landscape","hazy distant mountains summer"],autumn:["hazy autumn forest distant trees","atmospheric haze fall landscape"]},
+    sunset: {winter:["hazy winter sunset distant peaks","atmospheric haze snow dusk"],spring:["hazy spring sunset distant hills","atmospheric haze meadow dusk"],summer:["hazy summer sunset distant mountains","heat haze golden hour"],autumn:["hazy autumn sunset distant trees","atmospheric haze fall dusk"]},
+    night:  {winter:["hazy winter night distant lights","atmospheric haze snow night"],spring:["hazy spring night","atmospheric haze meadow night"],summer:["hazy summer night distant hills","heat haze night"],autumn:["hazy autumn night distant trees","atmospheric haze fall night"]},
+  },
+  windy: {
+    sunrise:{winter:["windswept snow dawn","wind blowing pines morning"],spring:["windswept meadow dawn","wind grass morning"],summer:["windswept ridge sunrise","wind alpine morning"],autumn:["windswept autumn leaves dawn","wind fall trees morning"]},
+    day:    {winter:["windswept snow forest","blowing snow trees"],spring:["windswept spring meadow","wind grass landscape"],summer:["windswept ridge summer","wind alpine ridge"],autumn:["windswept autumn forest","wind blowing fall leaves"]},
+    sunset: {winter:["windswept snow dusk","wind snow sunset"],spring:["windswept meadow sunset","wind spring dusk"],summer:["windswept ridge sunset","wind alpine dusk"],autumn:["windswept autumn sunset","wind fall leaves dusk"]},
+    night:  {winter:["windswept snow night","wind snow night"],spring:["windswept meadow night","wind spring night"],summer:["windswept ridge night","wind alpine night"],autumn:["windswept autumn night","wind fall night"]},
+  },
+  overcast: {
+    sunrise:{winter:["overcast snowy dawn grey sky","heavy overcast winter morning"],spring:["overcast meadow grey dawn","heavy overcast spring morning"],summer:["overcast lake grey dawn","heavy overcast summer morning"],autumn:["overcast autumn forest dawn","heavy overcast fall morning"]},
+    day:    {winter:["overcast snowy forest grey sky","leaden sky winter"],spring:["overcast green valley grey sky","leaden sky spring"],summer:["overcast mountain range grey","leaden sky summer"],autumn:["overcast autumn trees grey","leaden sky fall"]},
+    sunset: {winter:["overcast winter dusk grey","heavy overcast snow sunset"],spring:["overcast spring sunset grey","heavy overcast meadow dusk"],summer:["overcast summer sunset grey","heavy overcast lake dusk"],autumn:["overcast autumn sunset grey","heavy overcast fall dusk"]},
+    night:  {winter:["overcast winter night","heavy clouds winter night"],spring:["overcast spring night","heavy clouds spring night"],summer:["overcast summer night","heavy clouds summer night"],autumn:["overcast autumn night","heavy clouds fall night"]},
+  },
+  cloudy: {
+    sunrise:{winter:["cloudy winter morning snow","mostly cloudy winter dawn"],spring:["cloudy spring morning meadow","mostly cloudy spring dawn"],summer:["cloudy summer morning lake","mostly cloudy summer dawn"],autumn:["cloudy autumn forest morning","mostly cloudy fall dawn"]},
+    day:    {winter:["cloudy winter landscape snow","mostly cloudy winter forest"],spring:["cloudy green valley","mostly cloudy spring hills"],summer:["cloudy mountain range","mostly cloudy alpine lake"],autumn:["cloudy autumn trees","mostly cloudy fall forest"]},
+    sunset: {winter:["cloudy winter sunset snow","mostly cloudy snow dusk"],spring:["cloudy meadow dusk","mostly cloudy spring sunset"],summer:["cloudy mountain sunset","mostly cloudy lake dusk"],autumn:["cloudy autumn sunset","mostly cloudy fall dusk"]},
+    night:  {winter:["cloudy winter night moon","mostly cloudy snow night"],spring:["cloudy forest night","mostly cloudy spring night"],summer:["cloudy mountain night","mostly cloudy summer night"],autumn:["cloudy autumn night","moody fall forest"]},
+  },
+  partly_cloudy: {
+    sunrise:{winter:["partly cloudy snowy dawn","scattered clouds winter morning"],spring:["partly cloudy meadow dawn","scattered clouds spring morning"],summer:["partly cloudy lake dawn","scattered clouds summer morning"],autumn:["partly cloudy autumn dawn","scattered clouds fall morning"]},
+    day:    {winter:["partly cloudy snowy mountains","scattered clouds winter"],spring:["partly cloudy spring valley","scattered clouds meadow"],summer:["partly cloudy alpine lake","scattered clouds mountains"],autumn:["partly cloudy autumn forest","scattered clouds fall trees"]},
+    sunset: {winter:["partly cloudy winter sunset","scattered clouds snow dusk"],spring:["partly cloudy spring sunset","scattered clouds meadow dusk"],summer:["partly cloudy summer sunset","scattered clouds lake dusk"],autumn:["partly cloudy autumn sunset","scattered clouds fall dusk"]},
+    night:  {winter:["partly cloudy winter night moon","scattered clouds snow night"],spring:["partly cloudy spring night","scattered clouds spring night"],summer:["partly cloudy summer night stars","scattered clouds night"],autumn:["partly cloudy autumn night","scattered clouds fall night"]},
+  },
+  mostly_clear: {
+    sunrise:{winter:["mostly clear snowy dawn","high cirrus winter morning"],spring:["mostly clear spring dawn","high cirrus meadow morning"],summer:["mostly clear summer dawn","high cirrus mountain morning"],autumn:["mostly clear autumn dawn","high cirrus fall morning"]},
+    day:    {winter:["mostly clear blue sky snow","wispy clouds winter"],spring:["mostly clear spring sky","wispy clouds spring"],summer:["mostly clear summer sky alpine","wispy clouds summer"],autumn:["mostly clear autumn sky","wispy clouds fall"]},
+    sunset: {winter:["mostly clear winter sunset","wispy cirrus winter dusk"],spring:["mostly clear spring sunset","wispy cirrus spring dusk"],summer:["mostly clear summer sunset","wispy cirrus summer dusk"],autumn:["mostly clear autumn sunset","wispy cirrus fall dusk"]},
+    night:  {winter:["mostly clear winter night stars","starry winter sky"],spring:["mostly clear spring night stars","starry spring sky"],summer:["mostly clear summer night milky way","starry summer sky"],autumn:["mostly clear autumn night stars","starry fall sky"]},
+  },
+  clear: {
+    sunrise:{winter:["snowy forest dawn","frosted meadow sunrise"],spring:["meadow sunrise","misty valley dawn"],summer:["mountain lake sunrise","wildflower field dawn"],autumn:["autumn forest sunrise","golden meadow dawn"]},
+    day:    {winter:["snowy mountains blue sky","frozen lake clear day"],spring:["green valley blue sky","cherry blossom landscape"],summer:["alpine lake summer","sunny mountain range"],autumn:["autumn forest sunny","golden larch mountains"]},
+    sunset: {winter:["snowy peak sunset","winter lake sunset"],spring:["meadow sunset","valley sunset spring"],summer:["lake sunset summer","golden hour mountains"],autumn:["autumn forest sunset","red maple sunset"]},
+    night:  {winter:["snowy forest stars","aurora snow landscape"],spring:["forest night stars","milky way meadow"],summer:["alpine lake stars","milky way mountains"],autumn:["autumn forest night","starry pine forest"]},
+  },
+};
+
+function hashStr(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=(h*16777619)>>>0;}return h;}
+function pickQuery(c,t,s){
+  const b=QUERIES[c]||QUERIES.clear;
+  const list=b[t][s];
+  return list[hashStr(c+"|"+t+"|"+s)%list.length];
+}
+
+function unsplashUrl(q,bust){
+  const e=encodeURIComponent(q.replace(/\s+/g,","));
+  return "https://source.unsplash.com/"+CONFIG.IMG_W+"x"+CONFIG.IMG_H+"/?"+e+"&sig="+bust;
+}
+function picsumUrl(seed){
+  return "https://picsum.photos/seed/"+encodeURIComponent(seed)+"/"+CONFIG.IMG_W+"/"+CONFIG.IMG_H;
+}
+
+function preload(url){
+  return new Promise((res,rej)=>{
+    const img=new Image();
+    img.onload=()=>res(url);
+    img.onerror=()=>rej(new Error("img failed: "+url));
+    img.src=url;
+  });
+}
+
+let frontLayer="A";
+async function showImage(url){
+  await preload(url);
+  const a=document.getElementById("layerA"), b=document.getElementById("layerB");
+  const showing=frontLayer==="A"?a:b, hidden=frontLayer==="A"?b:a;
+  hidden.style.backgroundImage="url('"+url+"')";
+  void hidden.offsetWidth;
+  hidden.classList.add("visible");
+  showing.classList.remove("visible");
+  frontLayer=frontLayer==="A"?"B":"A";
+}
+
+let stationLatLon=null;
+async function getStationLatLon(){
+  if (stationLatLon) return stationLatLon;
+  try{
+    const r=await fetch(wuPwsCurrentUrl(),{cache:"no-store"});
+    if (!r.ok) throw new Error("pws "+r.status);
+    const d=await r.json();
+    const o=d&&d.observations&&d.observations[0];
+    if (o && o.lat!=null && o.lon!=null){
+      stationLatLon={lat:o.lat,lon:o.lon};
+      return stationLatLon;
+    }
+  }catch(e){console.warn("PWS lat/lon lookup failed:",e);}
+  return null;
+}
+
+let lastKey=null;
+async function tick(){
+  const now=new Date();
+  const tod=timeBucket(now), sea=season(now);
+
+  // 1. PWS
+  let pwsObs=null;
+  try{
+    const r=await fetch(wuPwsCurrentUrl(),{cache:"no-store"});
+    if (r.ok){
+      const d=await r.json();
+      pwsObs=d&&d.observations&&d.observations[0];
+      if (pwsObs && pwsObs.lat!=null && pwsObs.lon!=null){
+        stationLatLon={lat:pwsObs.lat,lon:pwsObs.lon};
+      }
+    }
+  }catch(e){console.warn("PWS fetch failed:",e);}
+
+  // 2. WU at station coords
+  let wuPhrase="", wuCond=null;
+  const loc=stationLatLon||await getStationLatLon();
+  if (loc){
+    try{
+      const r=await fetch(wuConditionsUrl(loc.lat,loc.lon),{cache:"no-store"});
+      if (r.ok){
+        const d=await r.json();
+        wuPhrase=(d&&(d.wxPhraseLong||d.wxPhraseMedium||d.wxPhraseShort))||"";
+        wuCond=phraseToCondition(wuPhrase);
+      }
+    }catch(e){console.warn("WU conditions fetch failed:",e);}
+  }
+
+  // 3. Resolve
+  const condition=resolveCondition(pwsObs,wuCond);
+  const key=condition+"|"+tod+"|"+sea;
+  setDebug("key="+key+
+    "  |  pws="+(pwsObs?classifyFromPWS(pwsObs):"—")+
+    "  |  wu=\""+(wuPhrase||"—")+"\" → "+(wuCond||"—"));
+
+  if (key!==lastKey){
+    const q=pickQuery(condition,tod,sea);
+    const stamp=Date.now();
+    const primary=unsplashUrl(q,stamp);
+    const fallback=picsumUrl(key+"-"+stamp);
+    try { await showImage(primary); }
+    catch {
+      try { await showImage(fallback); }
+      catch(e){ console.warn("Both image sources failed:",e); }
+    }
+    lastKey=key;
+  }
+}
+
+function setDebug(s){
+  const el=document.getElementById("debug");
+  if (el) el.textContent=s;
+}
+
+if (new URLSearchParams(location.search).get("debug")==="1"){
+  document.body.classList.add("debug");
+}
+
+tick();
+setInterval(tick,CONFIG.POLL_MS);
+</script>
+</body>
+</html>
