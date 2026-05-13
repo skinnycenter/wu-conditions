@@ -78,9 +78,6 @@ const CONFIG = {
 const wuPwsCurrentUrl = () =>
   CONFIG.WU_PROXY_URL + "/pws?stationId=" + encodeURIComponent(CONFIG.STATION_ID);
 
-const wuConditionsUrl = (lat, lon) =>
-  CONFIG.WU_PROXY_URL + "/conditions?geocode=" + lat + "," + lon;
-
 function num(v) { if (v==null) return null; const n=+v; return isNaN(n)?null:n; }
 
 function timeBucket(d) {
@@ -128,32 +125,62 @@ function phraseToCondition(p) {
   return null;
 }
 
-/* ---------- PWS-only classifier ---------- */
+/* ---------- PWS-only classifier ----------
+   Since this is now the sole data source, we use every signal the
+   station offers: precip rate/total, temperature, wind gust, humidity,
+   dewpoint spread, and solar radiation. */
 function classifyFromPWS(obs) {
   if (!obs) return "clear";
   const im = obs.imperial || {};
   const rate  = num(im.precipRate)  ?? 0;
   const total = num(im.precipTotal) ?? 0;
   const temp  = num(im.temp);
+  const dewpt = num(im.dewpt);
   const gust  = num(im.windGust)    ?? 0;
   const hum   = num(obs.humidity)   ?? 0;
   const sol   = num(obs.solarRadiation);
   const frozen = temp !== null && temp <= 34;
+  const nearFrozen = temp !== null && temp > 28 && temp <= 36;
 
-  if (rate >= 0.30) return frozen ? "heavy_snow" : "heavy_rain";
-  if (rate >= 0.10) return frozen ? "snow"       : "rain";
-  if (rate >= 0.02) return frozen ? "light_snow" : "light_rain";
-  if (total > 0.05 && rate > 0) return frozen ? "flurries" : "light_rain";
+  // Precip: rate sets intensity, temp picks rain vs snow.
+  // Near-freezing precip is ambiguous — call it wintry_mix.
+  if (rate >= 0.30) {
+    if (nearFrozen) return "wintry_mix";
+    return frozen ? "heavy_snow" : "heavy_rain";
+  }
+  if (rate >= 0.10) {
+    if (nearFrozen) return "wintry_mix";
+    return frozen ? "snow" : "rain";
+  }
+  if (rate >= 0.02) {
+    if (nearFrozen) return "wintry_mix";
+    return frozen ? "light_snow" : "light_rain";
+  }
+  // Light recent total with no current rate -> flurries/drizzle aftermath
+  if (total > 0.05 && rate === 0 && hum >= 85) {
+    return frozen ? "flurries" : "light_rain";
+  }
+
   if (gust >= 35) return "windy";
+
+  // Fog: humidity near 100% AND dewpoint very close to temp
+  const tempDewSpread = (temp !== null && dewpt !== null) ? (temp - dewpt) : 99;
+  if (hum >= 95 && tempDewSpread <= 3) return "fog";
   if (hum >= 92 && (sol === null || sol < 80)) return "fog";
 
+  // Sky state from solar radiation (only useful during daylight)
   const h = new Date().getHours();
   const day = h >= 8 && h < 18;
   if (day && sol !== null) {
-    if (sol < 150) return "overcast";
-    if (sol < 350) return "cloudy";
-    if (sol < 600) return "partly_cloudy";
+    if (sol < 120) return "overcast";
+    if (sol < 300) return "cloudy";
+    if (sol < 550) return "partly_cloudy";
+    if (sol < 750) return "mostly_clear";
+    return "clear";
   }
+  // Night or no solar data: humidity-based guess
+  if (hum >= 85) return "cloudy";
+  if (hum >= 70) return "partly_cloudy";
   return "clear";
 }
 
@@ -436,39 +463,20 @@ async function tick(){
   const now=new Date();
   const tod=timeBucket(now), sea=season(now);
 
-  // 1. PWS
+  // PWS observation (ground truth)
   let pwsObs=null;
   try{
     const r=await fetch(wuPwsCurrentUrl(),{cache:"no-store"});
     if (r.ok){
       const d=await r.json();
       pwsObs=d&&d.observations&&d.observations[0];
-      if (pwsObs && pwsObs.lat!=null && pwsObs.lon!=null){
-        stationLatLon={lat:pwsObs.lat,lon:pwsObs.lon};
-      }
     }
   }catch(e){console.warn("PWS fetch failed:",e);}
 
-  // 2. WU at station coords
-  let wuPhrase="", wuCond=null;
-  const loc=stationLatLon||await getStationLatLon();
-  if (loc){
-    try{
-      const r=await fetch(wuConditionsUrl(loc.lat,loc.lon),{cache:"no-store"});
-      if (r.ok){
-        const d=await r.json();
-        wuPhrase=(d&&(d.wxPhraseLong||d.wxPhraseMedium||d.wxPhraseShort))||"";
-        wuCond=phraseToCondition(wuPhrase);
-      }
-    }catch(e){console.warn("WU conditions fetch failed:",e);}
-  }
-
-  // 3. Resolve
-  const condition=resolveCondition(pwsObs,wuCond);
+  // Classify from PWS alone
+  const condition=classifyFromPWS(pwsObs);
   const key=condition+"|"+tod+"|"+sea;
-  setDebug("key="+key+
-    "  |  pws="+(pwsObs?classifyFromPWS(pwsObs):"—")+
-    "  |  wu=\""+(wuPhrase||"—")+"\" → "+(wuCond||"—"));
+  setDebug("key="+key+"  |  pws="+(pwsObs?condition:"—"));
 
   if (key!==lastKey){
     const q=pickQuery(condition,tod,sea);
