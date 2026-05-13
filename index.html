@@ -65,7 +65,10 @@
 
 const CONFIG = {
   STATION_ID: "KNYBALLS111",
-  WU_API_KEY: "eaH6I4sr",
+  // Cloudflare Worker that proxies the WU API with CORS headers.
+  // After deploying the worker, paste its URL here (no trailing slash).
+  // Example: "https://wu-proxy.yourname.workers.dev"
+  WU_PROXY_URL: "https://wu-proxy.sambas-lattice2z.workers.dev",
   UNSPLASH_ACCESS_KEY: "9ha2EhsXCNFMTzOtaaWxIiECn-eKhX5GeCQCgmgPsh0",
   POLL_MS: 5 * 60 * 1000,
   IMG_W: 2160,
@@ -73,14 +76,10 @@ const CONFIG = {
 };
 
 const wuPwsCurrentUrl = () =>
-  "https://api.weather.com/v2/pws/observations/current"
-  + "?stationId=" + CONFIG.STATION_ID
-  + "&format=json&units=e&apiKey=" + CONFIG.WU_API_KEY;
+  CONFIG.WU_PROXY_URL + "/pws?stationId=" + encodeURIComponent(CONFIG.STATION_ID);
 
 const wuConditionsUrl = (lat, lon) =>
-  "https://api.weather.com/v3/wx/observations/current"
-  + "?geocode=" + lat + "," + lon
-  + "&units=e&language=en-US&format=json&apiKey=" + CONFIG.WU_API_KEY;
+  CONFIG.WU_PROXY_URL + "/conditions?geocode=" + lat + "," + lon;
 
 function num(v) { if (v==null) return null; const n=+v; return isNaN(n)?null:n; }
 
